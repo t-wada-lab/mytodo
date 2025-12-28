@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mytodo",
+  "compatibility_date": "2025-12-28",
+  "pages_build_output_dir": "./dist",
+  "compatibility_flags": ["nodejs_compat"],
+  
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mytodo-db",
+      "database_id": "253f45fa-257f-47db-9cf2-dd9fdd123043"
+    }
+  ],
+  
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "mytodo-files"
+    }
+  ]
+}
