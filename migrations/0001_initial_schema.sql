@@ -59,6 +59,8 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task ON attachments(task_id);
 
 -- 初期セクションを挿入
 INSERT INTO sections (name, icon, sort_order) VALUES 
-  ('仕事', '💼', 1),
-  ('塾関連', '📚', 2),
-  ('プライベート', '🏠', 3);
+  ('todo（最重要）', '⭐', 1),
+  ('todo', '📝', 2),
+  ('AI開発タスク', '🤖', 3),
+  ('研究リスト', '🔬', 4),
+  ('書籍input', '📖', 5);

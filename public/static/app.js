@@ -560,6 +560,14 @@ function showAddTaskModal() {
       </div>
     </div>
   `;
+
+  // モーダル表示後にタスク名入力欄にフォーカス
+  setTimeout(() => {
+    const taskTitleInput = document.getElementById("task-title");
+    if (taskTitleInput) {
+      taskTitleInput.focus();
+    }
+  }, 100);
 }
 
 function updateReminderDay() {
