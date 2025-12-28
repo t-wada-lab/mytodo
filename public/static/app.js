@@ -48,6 +48,7 @@ const state = {
   sidebarOpen: false,
   editingTask: null,
   newTaskAttachments: [], // 新規タスク作成時の添付ファイル
+  isSubmitting: false, // 送信中のフラグ
 };
 
 // 日付フォーマット
@@ -134,6 +135,19 @@ async function render() {
       <nav>
         <!-- スマートリスト -->
         <div class="sidebar-item ${
+          state.currentView === "important" ? "active" : ""
+        }" 
+             onclick="setView('important')">
+          <i class="fas fa-star text-yellow-500"></i>
+          <span>重要</span>
+          ${
+            state.stats.important
+              ? `<span class="badge">${state.stats.important}</span>`
+              : ""
+          }
+        </div>
+        
+        <div class="sidebar-item ${
           state.currentView === "today" ? "active" : ""
         }" 
              onclick="setView('today')">
@@ -165,24 +179,24 @@ async function render() {
         </div>
         
         <div class="sidebar-item ${
-          state.currentView === "important" ? "active" : ""
-        }" 
-             onclick="setView('important')">
-          <i class="fas fa-star text-yellow-500"></i>
-          <span>重要</span>
-          ${
-            state.stats.important
-              ? `<span class="badge">${state.stats.important}</span>`
-              : ""
-          }
-        </div>
-        
-        <div class="sidebar-item ${
           state.currentView === "all" ? "active" : ""
         }" 
              onclick="setView('all')">
           <i class="fas fa-inbox text-gray-400"></i>
           <span>すべて</span>
+        </div>
+        
+        <div class="sidebar-item ${
+          state.currentView === "logbox" ? "active" : ""
+        }" 
+             onclick="setView('logbox')">
+          <i class="fas fa-archive text-purple-400"></i>
+          <span>ログボックス</span>
+          ${
+            state.stats.logbox
+              ? `<span class="badge">${state.stats.logbox}</span>`
+              : ""
+          }
         </div>
         
         <!-- セクション区切り -->
@@ -201,7 +215,8 @@ async function render() {
               ? "active"
               : ""
           }" 
-               onclick="setSection(${s.id})">
+               onclick="if (!dragState.isDragging) setSection(${s.id})"
+               data-section-id="${s.id}">
             <span>${s.icon}</span>
             <span>${s.name}</span>
             ${s.task_count ? `<span class="badge">${s.task_count}</span>` : ""}
@@ -239,16 +254,16 @@ async function render() {
       </div>
     </main>
     
-    <!-- FAB -->
-    ${
-      state.currentView !== "trash"
-        ? `
+      <!-- FAB -->
+      ${
+        state.currentView !== "trash" && state.currentView !== "logbox"
+          ? `
       <button class="fab" onclick="showAddTaskModal()">
         <i class="fas fa-plus"></i>
       </button>
     `
-        : ""
-    }
+          : ""
+      }
     
     <!-- モーダル -->
     <div id="modal-container"></div>
@@ -265,6 +280,8 @@ function getViewTitle() {
       return "⭐ 重要";
     case "all":
       return "📥 すべて";
+    case "logbox":
+      return "📦 ログボックス";
     case "trash":
       return "🗑️ ゴミ箱";
     case "section":
@@ -282,11 +299,17 @@ function renderTasks() {
     return `
       <div class="empty-state">
         <i class="fas fa-${
-          state.currentView === "trash" ? "trash" : "check-circle"
+          state.currentView === "trash"
+            ? "trash"
+            : state.currentView === "logbox"
+            ? "archive"
+            : "check-circle"
         }"></i>
         <p>${
           state.currentView === "trash"
             ? "ゴミ箱は空です"
+            : state.currentView === "logbox"
+            ? "ログボックスは空です"
             : "タスクがありません"
         }</p>
       </div>
@@ -306,7 +329,7 @@ function renderTasks() {
            onclick="showTaskDetail(${task.id})">
         <div class="flex items-start gap-3">
           ${
-            state.currentView !== "trash"
+            state.currentView !== "trash" && state.currentView !== "logbox"
               ? `
             <div class="checkbox ${task.is_completed ? "checked" : ""} ${
                   task.is_important ? "important" : ""
@@ -319,6 +342,12 @@ function renderTasks() {
                   ? '<i class="fas fa-check text-white text-sm"></i>'
                   : ""
               }
+            </div>
+          `
+              : state.currentView === "logbox"
+              ? `
+            <div class="checkbox checked" style="opacity: 0.6;">
+              <i class="fas fa-check text-white text-sm"></i>
             </div>
           `
               : ""
@@ -399,7 +428,18 @@ function escapeHtml(text) {
 // サイドバートグル
 function toggleSidebar() {
   state.sidebarOpen = !state.sidebarOpen;
-  render();
+  // サイドバーの表示/非表示はCSSクラスの変更のみで対応（再レンダリング不要）
+  const sidebar = document.querySelector(".sidebar");
+  const overlay = document.querySelector(".sidebar-overlay");
+  if (sidebar) {
+    if (state.sidebarOpen) {
+      sidebar.classList.add("open");
+      if (overlay) overlay.classList.remove("hidden");
+    } else {
+      sidebar.classList.remove("open");
+      if (overlay) overlay.classList.add("hidden");
+    }
+  }
 }
 
 // ビュー切り替え
@@ -439,17 +479,56 @@ async function loadTasks() {
 
 // タスク完了トグル
 async function toggleComplete(id, completed) {
-  await API.put(`/api/tasks/${id}`, { is_completed: completed });
-  await loadData();
-  await loadTasks();
-  render();
-  showToast(completed ? "タスクを完了しました" : "タスクを未完了に戻しました");
+  // 即座にUIを更新（楽観的更新）
+  const task = state.tasks.find((t) => t.id === id);
+  if (task) {
+    task.is_completed = completed ? 1 : 0;
+    if (completed) {
+      task.completed_at = new Date().toISOString();
+    }
+    render();
+  }
+
+  try {
+    await API.put(`/api/tasks/${id}`, { is_completed: completed });
+
+    // 完了した場合はログボックスへ移動するメッセージを表示
+    if (completed) {
+      showToast("タスクを完了しました。ログボックスへ移動しました");
+    } else {
+      showToast("タスクを未完了に戻しました");
+    }
+
+    // バックグラウンドでデータを更新
+    Promise.all([loadData(), loadTasks()]).then(() => {
+      render();
+    });
+  } catch (error) {
+    console.error("Toggle complete error:", error);
+    // エラー時は元に戻す
+    if (task) {
+      task.is_completed = completed ? 0 : 1;
+      render();
+    }
+    showToast("タスクの更新に失敗しました", "error");
+  }
 }
 
 // タスク追加モーダル
 function showAddTaskModal() {
   // 添付ファイルをリセット
   state.newTaskAttachments = [];
+
+  // モバイルでキーボードを確実に表示させるため、一時的な入力フィールドを作成
+  const tempInput = document.createElement("input");
+  tempInput.type = "text";
+  tempInput.style.position = "fixed";
+  tempInput.style.top = "-1000px";
+  tempInput.style.left = "-1000px";
+  tempInput.style.opacity = "0";
+  tempInput.style.pointerEvents = "none";
+  document.body.appendChild(tempInput);
+  tempInput.focus();
 
   const modal = document.getElementById("modal-container");
   modal.innerHTML = `
@@ -471,63 +550,68 @@ function showAddTaskModal() {
               <textarea id="task-desc" class="input" rows="2" placeholder="メモ（任意）"></textarea>
             </div>
             
-            <div class="grid grid-cols-2 gap-3 mb-4">
-              <div>
-                <label class="block text-sm text-gray-400 mb-1">セクション</label>
-                <select id="task-section" class="input">
-                  <option value="">なし</option>
-                  ${state.sections
-                    .map(
-                      (s) => `
-                    <option value="${s.id}" ${
-                        state.currentSectionId == s.id ? "selected" : ""
-                      }>
-                      ${s.icon} ${s.name}
-                    </option>
-                  `
-                    )
-                    .join("")}
+            <!-- Things3風のコンパクトなUI -->
+            <div class="mb-4">
+              <div class="flex items-center gap-2 flex-wrap">
+                <!-- セクション -->
+                <button type="button" onclick="showSectionPicker()" class="compact-btn" id="section-btn">
+                  <i class="fas fa-folder text-gray-400"></i>
+                  <span id="selected-section-text">セクション</span>
+                  <i class="fas fa-chevron-down text-xs text-gray-500"></i>
+                </button>
+                
+                <!-- 期限 -->
+                <button type="button" onclick="showDatePicker()" class="compact-btn" id="date-btn">
+                  <i class="fas fa-calendar text-gray-400"></i>
+                  <span id="selected-date-text">期限</span>
+                  <i class="fas fa-chevron-down text-xs text-gray-500"></i>
+                </button>
+                
+                <!-- リマインダー -->
+                <button type="button" onclick="showReminderPicker()" class="compact-btn" id="reminder-btn">
+                  <i class="fas fa-bell text-gray-400"></i>
+                  <span id="selected-reminder-text">リマインダー</span>
+                  <i class="fas fa-chevron-down text-xs text-gray-500"></i>
+                </button>
+                
+                <!-- 重要 -->
+                <button type="button" id="important-btn" onclick="toggleImportantBtn()" class="compact-btn">
+                  <i class="fas fa-star text-gray-400"></i>
+                </button>
+              </div>
+              
+              <!-- リマインダーの日/曜日選択（表示時のみ） -->
+              <div id="reminder-day-container" class="hidden mt-2">
+                <select id="task-reminder-day" class="input text-sm">
+                  <option value="">選択してください</option>
                 </select>
               </div>
-              <div>
-                <label class="block text-sm text-gray-400 mb-1">期限</label>
-                <input type="date" id="task-due" class="input" 
-                       value="${
-                         state.currentView === "today"
-                           ? new Date().toISOString().split("T")[0]
-                           : ""
-                       }">
-              </div>
-            </div>
-            
-            <div class="grid grid-cols-2 gap-3 mb-4">
-              <div>
-                <label class="block text-sm text-gray-400 mb-1">リマインダー</label>
-                <select id="task-reminder" class="input" onchange="updateReminderDay()">
-                  <option value="">なし</option>
-                  <option value="daily">毎日</option>
-                  <option value="weekly">毎週</option>
-                  <option value="monthly">毎月</option>
-                  <option value="monthly_date">毎月○日</option>
-                </select>
-              </div>
-              <div id="reminder-day-container" class="hidden">
-                <label class="block text-sm text-gray-400 mb-1">日/曜日</label>
-                <select id="task-reminder-day" class="input"></select>
-              </div>
-            </div>
-            
-            <div class="flex items-center gap-2 mb-4">
-              <input type="checkbox" id="task-important" class="w-5 h-5 accent-yellow-500">
-              <label for="task-important" class="text-sm">
-                <i class="fas fa-star text-yellow-500 mr-1"></i>重要
-              </label>
+              
+              <!-- 隠しフィールド -->
+              <input type="hidden" id="task-section" value="${
+                state.currentSectionId || ""
+              }">
+              <input type="hidden" id="task-due" value="${
+                state.currentView === "today"
+                  ? new Date().toISOString().split("T")[0]
+                  : ""
+              }">
+              <input type="hidden" id="task-reminder" value="">
+              <input type="hidden" id="task-important" value="false">
             </div>
             
             <!-- 添付ファイル -->
             <div class="mb-4">
               <label class="block text-sm text-gray-400 mb-2">添付ファイル</label>
               <div class="attachment-preview" id="new-task-attachments-list"></div>
+              
+              <!-- アップロード進捗表示 -->
+              <div id="upload-progress" class="hidden mb-2">
+                <div class="flex items-center gap-2 text-sm text-gray-400 bg-gray-800 p-2 rounded">
+                  <i class="fas fa-spinner fa-spin"></i>
+                  <span id="upload-progress-text">添付ファイルをアップロード中...</span>
+                </div>
+              </div>
               
               <div class="quick-attach-bar">
                 <label class="quick-attach-btn cursor-pointer">
@@ -548,11 +632,14 @@ function showAddTaskModal() {
             </div>
             
             <div class="flex gap-3">
-              <button type="button" class="btn btn-secondary flex-1" onclick="closeModal()">
+              <button type="button" class="btn btn-secondary flex-1" onclick="closeModal()" id="cancel-task-btn">
                 キャンセル
               </button>
-              <button type="submit" class="btn btn-primary flex-1">
-                追加
+              <button type="submit" class="btn btn-primary flex-1" id="submit-task-btn">
+                <span id="submit-task-text">追加</span>
+                <span id="submit-task-loading" class="hidden">
+                  <i class="fas fa-spinner fa-spin mr-2"></i>追加中...
+                </span>
               </button>
             </div>
           </form>
@@ -561,13 +648,57 @@ function showAddTaskModal() {
     </div>
   `;
 
-  // モーダル表示後にタスク名入力欄にフォーカス
-  setTimeout(() => {
-    const taskTitleInput = document.getElementById("task-title");
-    if (taskTitleInput) {
-      taskTitleInput.focus();
-    }
-  }, 100);
+  // モーダル表示後にタスク名入力欄に即座にフォーカス（キーボードを確実に表示）
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const taskTitleInput = document.getElementById("task-title");
+      if (taskTitleInput) {
+        // 一時的な入力フィールドを削除
+        if (document.body.contains(tempInput)) {
+          document.body.removeChild(tempInput);
+        }
+
+        // 入力フィールドを可視領域にスクロール
+        taskTitleInput.scrollIntoView({ behavior: "smooth", block: "center" });
+
+        // フォーカスとクリックの両方を試す（モバイルブラウザ対応）
+        taskTitleInput.focus();
+
+        // モバイルブラウザによってはclick()も必要
+        setTimeout(() => {
+          taskTitleInput.click();
+          taskTitleInput.focus();
+        }, 50);
+
+        // さらに確実にするため、もう一度フォーカス
+        setTimeout(() => {
+          taskTitleInput.focus();
+        }, 150);
+      }
+
+      // Things3風UIの初期状態を設定
+      const sectionId = document.getElementById("task-section").value;
+      if (sectionId) {
+        const section = state.sections.find((s) => s.id == sectionId);
+        if (section) {
+          document.getElementById("selected-section-text").textContent =
+            section.name;
+          document.getElementById("section-btn").classList.add("active");
+        }
+      }
+
+      const dueDate = document.getElementById("task-due").value;
+      if (dueDate) {
+        const date = new Date(dueDate);
+        const month = date.getMonth() + 1;
+        const day = date.getDate();
+        document.getElementById(
+          "selected-date-text"
+        ).textContent = `${month}/${day}`;
+        document.getElementById("date-btn").classList.add("active");
+      }
+    });
+  });
 }
 
 function updateReminderDay() {
@@ -591,47 +722,489 @@ function updateReminderDay() {
   }
 }
 
+// Things3風のコンパクトUI用の関数
+function showSectionPicker() {
+  // 既存のドロップダウンがあれば削除
+  const existing = document.getElementById("section-dropdown-overlay");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+
+  const sectionBtn = document.getElementById("section-btn");
+  const rect = sectionBtn.getBoundingClientRect();
+  const currentSectionId = document.getElementById("task-section").value;
+  const currentSection = state.sections.find((s) => s.id == currentSectionId);
+
+  // オーバーレイとドロップダウンを作成
+  const overlay = document.createElement("div");
+  overlay.id = "section-dropdown-overlay";
+  overlay.className = "dropdown-overlay";
+  overlay.onclick = (e) => {
+    if (e.target === overlay) {
+      overlay.remove();
+    }
+  };
+
+  const dropdown = document.createElement("div");
+  dropdown.className = "dropdown-menu";
+  dropdown.style.position = "fixed";
+  dropdown.style.top = `${rect.bottom + 8}px`;
+  dropdown.style.left = `${rect.left}px`;
+  dropdown.style.minWidth = `${rect.width}px`;
+  dropdown.style.maxHeight = "300px";
+  dropdown.style.overflowY = "auto";
+  dropdown.onclick = (e) => e.stopPropagation();
+
+  // 「なし」オプション
+  const noneOption = document.createElement("div");
+  noneOption.className = "dropdown-item";
+  if (!currentSectionId) {
+    noneOption.classList.add("selected");
+  }
+  noneOption.innerHTML =
+    '<i class="fas fa-folder text-gray-400"></i><span>なし</span>';
+  noneOption.onclick = () => {
+    document.getElementById("task-section").value = "";
+    document.getElementById("selected-section-text").textContent = "セクション";
+    document.getElementById("section-btn").classList.remove("active");
+    overlay.remove();
+  };
+  dropdown.appendChild(noneOption);
+
+  // セクション一覧
+  state.sections.forEach((section) => {
+    const item = document.createElement("div");
+    item.className = "dropdown-item";
+    if (currentSectionId == section.id) {
+      item.classList.add("selected");
+    }
+    item.innerHTML = `<span>${section.icon}</span><span>${escapeHtml(
+      section.name
+    )}</span>`;
+    item.onclick = () => {
+      document.getElementById("task-section").value = section.id;
+      document.getElementById("selected-section-text").textContent =
+        section.name;
+      document.getElementById("section-btn").classList.add("active");
+      overlay.remove();
+    };
+    dropdown.appendChild(item);
+  });
+
+  overlay.appendChild(dropdown);
+  document.body.appendChild(overlay);
+
+  // アニメーション
+  requestAnimationFrame(() => {
+    overlay.style.opacity = "1";
+    dropdown.style.transform = "translateY(0)";
+    dropdown.style.opacity = "1";
+  });
+}
+
+function showDatePicker() {
+  // 既存のカレンダーがあれば削除
+  const existing = document.getElementById("calendar-overlay");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+
+  const currentValue = document.getElementById("task-due").value;
+  const selectedDate = currentValue
+    ? new Date(currentValue + "T00:00:00")
+    : null;
+  let currentMonth = selectedDate ? new Date(selectedDate) : new Date();
+  currentMonth.setDate(1); // 月の最初の日
+
+  // オーバーレイを作成
+  const overlay = document.createElement("div");
+  overlay.id = "calendar-overlay";
+  overlay.className = "calendar-overlay";
+  overlay.onclick = (e) => {
+    if (e.target === overlay) {
+      overlay.remove();
+    }
+  };
+
+  // カレンダーコンテナを作成
+  const calendar = document.createElement("div");
+  calendar.className = "calendar-picker";
+  calendar.onclick = (e) => e.stopPropagation();
+
+  // ヘッダー（月切り替え）
+  const header = document.createElement("div");
+  header.className = "calendar-header";
+
+  const prevBtn = document.createElement("button");
+  prevBtn.className = "calendar-nav-btn";
+  prevBtn.innerHTML = '<i class="fas fa-chevron-left"></i>';
+  prevBtn.onclick = () => {
+    currentMonth.setMonth(currentMonth.getMonth() - 1);
+    renderCalendar();
+  };
+
+  const monthYear = document.createElement("div");
+  monthYear.className = "calendar-month-year";
+
+  const nextBtn = document.createElement("button");
+  nextBtn.className = "calendar-nav-btn";
+  nextBtn.innerHTML = '<i class="fas fa-chevron-right"></i>';
+  nextBtn.onclick = () => {
+    currentMonth.setMonth(currentMonth.getMonth() + 1);
+    renderCalendar();
+  };
+
+  header.appendChild(prevBtn);
+  header.appendChild(monthYear);
+  header.appendChild(nextBtn);
+
+  // 曜日ヘッダー
+  const weekdays = document.createElement("div");
+  weekdays.className = "calendar-weekdays";
+  ["日", "月", "火", "水", "木", "金", "土"].forEach((day) => {
+    const dayCell = document.createElement("div");
+    dayCell.className = "calendar-weekday";
+    dayCell.textContent = day;
+    weekdays.appendChild(dayCell);
+  });
+
+  // 日付グリッド
+  const grid = document.createElement("div");
+  grid.className = "calendar-grid";
+
+  // カレンダーをレンダリングする関数
+  function renderCalendar() {
+    // 現在の選択値を再取得
+    const currentValue = document.getElementById("task-due").value;
+    const currentSelectedDate = currentValue
+      ? new Date(currentValue + "T00:00:00")
+      : null;
+
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+    monthYear.textContent = `${year}年${month + 1}月`;
+
+    // グリッドをクリア
+    grid.innerHTML = "";
+
+    // 月の最初の日の曜日を取得（0=日曜日）
+    const firstDay = new Date(year, month, 1).getDay();
+
+    // 月の日数を取得
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+    // 前月の最後の日を取得
+    const prevMonthDays = new Date(year, month, 0).getDate();
+
+    // 今日の日付
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // 前月の日付を表示
+    for (let i = firstDay - 1; i >= 0; i--) {
+      const day = prevMonthDays - i;
+      const dateCell = document.createElement("div");
+      dateCell.className = "calendar-day other-month";
+      dateCell.textContent = day;
+      grid.appendChild(dateCell);
+    }
+
+    // 今月の日付を表示
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateCell = document.createElement("div");
+      const cellDate = new Date(year, month, day);
+      cellDate.setHours(0, 0, 0, 0);
+
+      dateCell.className = "calendar-day";
+
+      // 今日の日付を強調
+      if (cellDate.getTime() === today.getTime()) {
+        dateCell.classList.add("today");
+      }
+
+      // 選択された日付をハイライト
+      if (
+        currentSelectedDate &&
+        cellDate.getTime() === currentSelectedDate.getTime()
+      ) {
+        dateCell.classList.add("selected");
+      }
+
+      dateCell.textContent = day;
+      dateCell.onclick = () => {
+        const selectedDateStr = `${year}-${String(month + 1).padStart(
+          2,
+          "0"
+        )}-${String(day).padStart(2, "0")}`;
+        document.getElementById("task-due").value = selectedDateStr;
+
+        const monthDisplay = month + 1;
+        const dayDisplay = day;
+        document.getElementById(
+          "selected-date-text"
+        ).textContent = `${monthDisplay}/${dayDisplay}`;
+        document.getElementById("date-btn").classList.add("active");
+
+        overlay.remove();
+      };
+
+      grid.appendChild(dateCell);
+    }
+
+    // 次月の日付を表示（グリッドを埋めるため）
+    const totalCells = firstDay + daysInMonth;
+    const remainingCells = 42 - totalCells; // 6週間分
+    for (let day = 1; day <= remainingCells && day <= 14; day++) {
+      const dateCell = document.createElement("div");
+      dateCell.className = "calendar-day other-month";
+      dateCell.textContent = day;
+      grid.appendChild(dateCell);
+    }
+  }
+
+  // 初期レンダリング
+  renderCalendar();
+
+  // 「なし」ボタン
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "calendar-clear-btn";
+  clearBtn.textContent = "なし";
+  clearBtn.onclick = () => {
+    document.getElementById("task-due").value = "";
+    document.getElementById("selected-date-text").textContent = "期限";
+    document.getElementById("date-btn").classList.remove("active");
+    overlay.remove();
+  };
+
+  calendar.appendChild(header);
+  calendar.appendChild(weekdays);
+  calendar.appendChild(grid);
+  calendar.appendChild(clearBtn);
+  overlay.appendChild(calendar);
+  document.body.appendChild(overlay);
+
+  // アニメーション
+  requestAnimationFrame(() => {
+    overlay.style.opacity = "1";
+    calendar.style.transform = "scale(1)";
+    calendar.style.opacity = "1";
+  });
+}
+
+function showReminderPicker() {
+  // 既存のドロップダウンがあれば削除
+  const existing = document.getElementById("reminder-dropdown-overlay");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+
+  const reminderBtn = document.getElementById("reminder-btn");
+  const rect = reminderBtn.getBoundingClientRect();
+  const reminderType = document.getElementById("task-reminder").value;
+
+  const reminderTypes = [
+    { value: "", label: "なし" },
+    { value: "daily", label: "毎日" },
+    { value: "weekly", label: "毎週" },
+    { value: "monthly", label: "毎月" },
+    { value: "monthly_date", label: "毎月○日" },
+  ];
+
+  // オーバーレイとドロップダウンを作成
+  const overlay = document.createElement("div");
+  overlay.id = "reminder-dropdown-overlay";
+  overlay.className = "dropdown-overlay";
+  overlay.onclick = (e) => {
+    if (e.target === overlay) {
+      overlay.remove();
+    }
+  };
+
+  const dropdown = document.createElement("div");
+  dropdown.className = "dropdown-menu";
+  dropdown.style.position = "fixed";
+  dropdown.style.top = `${rect.bottom + 8}px`;
+  dropdown.style.left = `${rect.left}px`;
+  dropdown.style.minWidth = `${rect.width}px`;
+  dropdown.onclick = (e) => e.stopPropagation();
+
+  // リマインダーオプション
+  reminderTypes.forEach((type) => {
+    const item = document.createElement("div");
+    item.className = "dropdown-item";
+    if (reminderType === type.value) {
+      item.classList.add("selected");
+    }
+    item.innerHTML = `<i class="fas fa-bell text-gray-400"></i><span>${escapeHtml(
+      type.label
+    )}</span>`;
+    item.onclick = () => {
+      document.getElementById("task-reminder").value = type.value;
+
+      if (type.value) {
+        document.getElementById("selected-reminder-text").textContent =
+          type.label;
+        document.getElementById("reminder-btn").classList.add("active");
+        updateReminderDay();
+      } else {
+        document.getElementById("selected-reminder-text").textContent =
+          "リマインダー";
+        document.getElementById("reminder-btn").classList.remove("active");
+        document
+          .getElementById("reminder-day-container")
+          .classList.add("hidden");
+      }
+      overlay.remove();
+    };
+    dropdown.appendChild(item);
+  });
+
+  overlay.appendChild(dropdown);
+  document.body.appendChild(overlay);
+
+  // アニメーション
+  requestAnimationFrame(() => {
+    overlay.style.opacity = "1";
+    dropdown.style.transform = "translateY(0)";
+    dropdown.style.opacity = "1";
+  });
+}
+
+function toggleImportantBtn() {
+  const importantBtn = document.getElementById("important-btn");
+  const importantInput = document.getElementById("task-important");
+  const isImportant = importantInput.value === "true";
+
+  if (isImportant) {
+    importantInput.value = "false";
+    importantBtn.classList.remove("active");
+    const icon = importantBtn.querySelector("i");
+    if (icon) {
+      icon.classList.remove("text-yellow-500");
+      icon.classList.add("text-gray-400");
+    }
+  } else {
+    importantInput.value = "true";
+    importantBtn.classList.add("active");
+    const icon = importantBtn.querySelector("i");
+    if (icon) {
+      icon.classList.remove("text-gray-400");
+      icon.classList.add("text-yellow-500");
+    }
+  }
+}
+
 async function createTask(e) {
   e.preventDefault();
 
-  const data = {
-    title: document.getElementById("task-title").value,
-    description: document.getElementById("task-desc").value || null,
-    section_id: document.getElementById("task-section").value || null,
-    due_date: document.getElementById("task-due").value || null,
-    is_important: document.getElementById("task-important").checked,
-    reminder_type: document.getElementById("task-reminder").value || null,
-    reminder_day: document.getElementById("task-reminder-day")?.value || null,
-  };
-
-  const result = await API.post("/api/tasks", data);
-  const taskId = result.id;
-
-  // 添付ファイルをアップロード
-  if (state.newTaskAttachments.length > 0) {
-    for (const attachment of state.newTaskAttachments) {
-      try {
-        if (attachment.type === "file") {
-          const formData = new FormData();
-          formData.append("file", attachment.file);
-          await API.upload(`/api/tasks/${taskId}/attachments`, formData);
-        } else if (attachment.type === "url") {
-          const formData = new FormData();
-          formData.append("url", attachment.url);
-          await API.upload(`/api/tasks/${taskId}/attachments`, formData);
-        }
-      } catch (error) {
-        console.error("Failed to upload attachment:", error);
-      }
-    }
-    state.newTaskAttachments = [];
+  // 重複送信を防止
+  if (state.isSubmitting) {
+    return;
   }
 
-  closeModal();
-  await loadData();
-  await loadTasks();
-  render();
-  showToast("タスクを追加しました");
+  state.isSubmitting = true;
+
+  // ボタンを無効化
+  const submitBtn = document.getElementById("submit-task-btn");
+  const cancelBtn = document.getElementById("cancel-task-btn");
+  const submitText = document.getElementById("submit-task-text");
+  const submitLoading = document.getElementById("submit-task-loading");
+
+  if (submitBtn) submitBtn.disabled = true;
+  if (cancelBtn) cancelBtn.disabled = true;
+  if (submitText) submitText.classList.add("hidden");
+  if (submitLoading) submitLoading.classList.remove("hidden");
+
+  try {
+    const data = {
+      title: document.getElementById("task-title").value,
+      description: document.getElementById("task-desc").value || null,
+      section_id: document.getElementById("task-section").value || null,
+      due_date: document.getElementById("task-due").value || null,
+      is_important: document.getElementById("task-important").value === "true",
+      reminder_type: document.getElementById("task-reminder").value || null,
+      reminder_day: document.getElementById("task-reminder-day")?.value || null,
+    };
+
+    const result = await API.post("/api/tasks", data);
+    const taskId = result.id;
+
+    // 添付ファイルをアップロード（進捗表示付き）
+    if (state.newTaskAttachments.length > 0) {
+      const uploadProgress = document.getElementById("upload-progress");
+      const uploadProgressText = document.getElementById(
+        "upload-progress-text"
+      );
+
+      if (uploadProgress) {
+        uploadProgress.classList.remove("hidden");
+        if (uploadProgressText) {
+          uploadProgressText.textContent = `添付ファイルをアップロード中... (0/${state.newTaskAttachments.length})`;
+        }
+      }
+
+      for (let i = 0; i < state.newTaskAttachments.length; i++) {
+        const attachment = state.newTaskAttachments[i];
+        try {
+          if (attachment.type === "file") {
+            const formData = new FormData();
+            formData.append("file", attachment.file);
+            await API.upload(`/api/tasks/${taskId}/attachments`, formData);
+          } else if (attachment.type === "url") {
+            const formData = new FormData();
+            formData.append("url", attachment.url);
+            await API.upload(`/api/tasks/${taskId}/attachments`, formData);
+          }
+
+          // 進捗を更新
+          if (uploadProgressText) {
+            uploadProgressText.textContent = `添付ファイルをアップロード中... (${
+              i + 1
+            }/${state.newTaskAttachments.length})`;
+          }
+        } catch (error) {
+          console.error("Failed to upload attachment:", error);
+        }
+      }
+
+      if (uploadProgress) {
+        uploadProgress.classList.add("hidden");
+      }
+      state.newTaskAttachments = [];
+    }
+
+    closeModal();
+    // 楽観的更新: タスクを即座に追加
+    const newTask = {
+      ...result,
+      attachment_count: state.newTaskAttachments.length,
+      section_name:
+        state.sections.find((s) => s.id == data.section_id)?.name || null,
+      section_icon:
+        state.sections.find((s) => s.id == data.section_id)?.icon || null,
+    };
+    state.tasks.unshift(newTask);
+    render();
+    showToast("タスクを追加しました");
+
+    // バックグラウンドでデータを更新（統計情報のみ）
+    Promise.all([loadData()]).then(() => {
+      render();
+    });
+  } catch (error) {
+    console.error("Create task error:", error);
+    showToast("タスクの追加に失敗しました", "error");
+  } finally {
+    // ボタンを再有効化
+    state.isSubmitting = false;
+    if (submitBtn) submitBtn.disabled = false;
+    if (cancelBtn) cancelBtn.disabled = false;
+    if (submitText) submitText.classList.remove("hidden");
+    if (submitLoading) submitLoading.classList.add("hidden");
+  }
 }
 
 // タスク詳細モーダル
@@ -805,14 +1378,17 @@ async function showTaskDetail(id) {
               </div>
               
               <div class="flex gap-3">
-                <button type="button" class="btn btn-danger" onclick="deleteTask(${id})">
+                <button type="button" class="btn btn-danger" onclick="deleteTask(${id})" id="delete-task-btn-${id}">
                   <i class="fas fa-trash"></i>
                 </button>
-                <button type="button" class="btn btn-secondary flex-1" onclick="closeModal()">
+                <button type="button" class="btn btn-secondary flex-1" onclick="closeModal()" id="cancel-edit-btn-${id}">
                   キャンセル
                 </button>
-                <button type="submit" class="btn btn-primary flex-1">
-                  保存
+                <button type="submit" class="btn btn-primary flex-1" id="submit-edit-btn-${id}">
+                  <span id="submit-edit-text-${id}">保存</span>
+                  <span id="submit-edit-loading-${id}" class="hidden">
+                    <i class="fas fa-spinner fa-spin mr-2"></i>保存中...
+                  </span>
                 </button>
               </div>
             </form>
@@ -877,52 +1453,122 @@ function updateEditReminderDay() {
 async function updateTask(e, id) {
   e.preventDefault();
 
-  const data = {
-    title: document.getElementById("edit-title").value,
-    description: document.getElementById("edit-desc").value || null,
-    section_id: document.getElementById("edit-section").value || null,
-    due_date: document.getElementById("edit-due").value || null,
-    is_important: document.getElementById("edit-important").checked,
-    reminder_type: document.getElementById("edit-reminder").value || null,
-    reminder_day: document.getElementById("edit-reminder-day")?.value || null,
-  };
+  // 重複送信を防止
+  if (state.isSubmitting) {
+    return;
+  }
 
-  await API.put(`/api/tasks/${id}`, data);
-  closeModal();
-  await loadData();
-  await loadTasks();
-  render();
-  showToast("タスクを更新しました");
+  state.isSubmitting = true;
+
+  // ボタンを無効化
+  const submitBtn = document.getElementById(`submit-edit-btn-${id}`);
+  const cancelBtn = document.getElementById(`cancel-edit-btn-${id}`);
+  const deleteBtn = document.getElementById(`delete-task-btn-${id}`);
+  const submitText = document.getElementById(`submit-edit-text-${id}`);
+  const submitLoading = document.getElementById(`submit-edit-loading-${id}`);
+
+  if (submitBtn) submitBtn.disabled = true;
+  if (cancelBtn) cancelBtn.disabled = true;
+  if (deleteBtn) deleteBtn.disabled = true;
+  if (submitText) submitText.classList.add("hidden");
+  if (submitLoading) submitLoading.classList.remove("hidden");
+
+  try {
+    const data = {
+      title: document.getElementById("edit-title").value,
+      description: document.getElementById("edit-desc").value || null,
+      section_id: document.getElementById("edit-section").value || null,
+      due_date: document.getElementById("edit-due").value || null,
+      is_important: document.getElementById("edit-important").checked,
+      reminder_type: document.getElementById("edit-reminder").value || null,
+      reminder_day: document.getElementById("edit-reminder-day")?.value || null,
+    };
+
+    await API.put(`/api/tasks/${id}`, data);
+
+    // 楽観的更新: タスクを即座に更新
+    const task = state.tasks.find((t) => t.id === id);
+    if (task) {
+      Object.assign(task, data);
+      if (data.section_id) {
+        const section = state.sections.find((s) => s.id == data.section_id);
+        if (section) {
+          task.section_name = section.name;
+          task.section_icon = section.icon;
+        }
+      }
+    }
+
+    closeModal();
+    render();
+    showToast("タスクを更新しました");
+
+    // バックグラウンドでデータを更新（統計情報のみ）
+    Promise.all([loadData()]).then(() => {
+      render();
+    });
+  } catch (error) {
+    console.error("Update task error:", error);
+    showToast("タスクの更新に失敗しました", "error");
+  } finally {
+    // ボタンを再有効化
+    state.isSubmitting = false;
+    if (submitBtn) submitBtn.disabled = false;
+    if (cancelBtn) cancelBtn.disabled = false;
+    if (deleteBtn) deleteBtn.disabled = false;
+    if (submitText) submitText.classList.remove("hidden");
+    if (submitLoading) submitLoading.classList.add("hidden");
+  }
 }
 
 async function deleteTask(id) {
   if (confirm("タスクをゴミ箱に移動しますか？")) {
-    await API.delete(`/api/tasks/${id}`);
+    // 楽観的更新: タスクを即座に削除
+    state.tasks = state.tasks.filter((t) => t.id !== id);
     closeModal();
-    await loadData();
-    await loadTasks();
     render();
     showToast("ゴミ箱に移動しました");
+
+    // バックグラウンドでAPI呼び出しとデータ更新
+    Promise.all([API.delete(`/api/tasks/${id}`), loadData()])
+      .then(() => {
+        render();
+      })
+      .catch((error) => {
+        console.error("Delete task error:", error);
+        // エラー時は再取得
+        loadTasks().then(() => render());
+      });
   }
 }
 
 async function restoreTask(id) {
   await API.post(`/api/tasks/${id}/restore`);
   closeModal();
-  await loadData();
-  await loadTasks();
+  // 復元後はゴミ箱ビューから離れるので、データを再取得
+  await Promise.all([loadData(), loadTasks()]);
   render();
   showToast("タスクを復元しました");
 }
 
 async function permanentDelete(id) {
   if (confirm("完全に削除しますか？この操作は取り消せません。")) {
-    await API.delete(`/api/tasks/${id}?permanent=true`);
+    // 楽観的更新: タスクを即座に削除
+    state.tasks = state.tasks.filter((t) => t.id !== id);
     closeModal();
-    await loadData();
-    await loadTasks();
     render();
     showToast("完全に削除しました");
+
+    // バックグラウンドでAPI呼び出しとデータ更新
+    Promise.all([API.delete(`/api/tasks/${id}?permanent=true`), loadData()])
+      .then(() => {
+        render();
+      })
+      .catch((error) => {
+        console.error("Permanent delete error:", error);
+        // エラー時は再取得
+        loadTasks().then(() => render());
+      });
   }
 }
 
@@ -1116,10 +1762,48 @@ function showAddSectionModal() {
 }
 
 async function addSection(name, icon) {
-  await API.post("/api/sections", { name, icon });
-  await loadData();
+  const result = await API.post("/api/sections", { name, icon });
+  // 楽観的更新: セクションを即座に追加
+  state.sections.push({ ...result, task_count: 0 });
   render();
   showToast("セクションを追加しました");
+
+  // バックグラウンドでデータを更新
+  loadData().then(() => render());
+}
+
+async function deleteSection(id, name) {
+  if (
+    confirm(
+      `セクション「${name}」を削除しますか？\nこのセクションに紐づくタスクはセクションなしに移動されます。`
+    )
+  ) {
+    try {
+      // 楽観的更新: セクションを即座に削除
+      state.sections = state.sections.filter((s) => s.id != id);
+      // セクションが選択されている場合は、ビューを変更
+      if (state.currentView === "section" && state.currentSectionId == id) {
+        state.currentView = "all";
+        state.currentSectionId = null;
+      }
+      render();
+      showToast("セクションを削除しました");
+
+      // バックグラウンドでAPI呼び出しとデータ更新
+      Promise.all([API.delete(`/api/sections/${id}`), loadData(), loadTasks()])
+        .then(() => {
+          render();
+        })
+        .catch((error) => {
+          console.error("Delete section error:", error);
+          // エラー時は再取得
+          Promise.all([loadData(), loadTasks()]).then(() => render());
+        });
+    } catch (error) {
+      console.error("Delete section error:", error);
+      showToast("セクションの削除に失敗しました", "error");
+    }
+  }
 }
 
 // モーダル閉じる
@@ -1152,11 +1836,292 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/static/sw.js").catch(() => {});
 }
 
+// 長押し・ドラッグ検出用の変数
+let longPressTimer = null;
+let longPressTarget = null;
+let dragState = {
+  isDragging: false,
+  draggedElement: null,
+  startY: 0,
+  startX: 0,
+  currentY: 0,
+  placeholder: null,
+  sectionId: null,
+};
+let touchStartPos = { x: 0, y: 0 };
+
+// 長押しイベントハンドラ
+function setupLongPressHandlers() {
+  document.addEventListener("touchstart", handleTouchStart, {
+    passive: false,
+  });
+  document.addEventListener("touchmove", handleTouchMove, { passive: false });
+  document.addEventListener("touchend", handleTouchEnd, { passive: true });
+  document.addEventListener("touchcancel", handleTouchEnd, {
+    passive: true,
+  });
+  document.addEventListener("mousedown", handleMouseDown);
+  document.addEventListener("mousemove", handleMouseMove);
+  document.addEventListener("mouseup", handleMouseUp);
+}
+
+function handleTouchStart(e) {
+  const sectionItem = e.target.closest(".sidebar-item[data-section-id]");
+  if (!sectionItem) return;
+
+  const sectionId = sectionItem.getAttribute("data-section-id");
+  if (!sectionId) return;
+
+  const touch = e.touches[0];
+  touchStartPos.x = touch.clientX;
+  touchStartPos.y = touch.clientY;
+  longPressTarget = sectionItem;
+
+  longPressTimer = setTimeout(() => {
+    // 長押し検出 - ドラッグモード開始
+    startDragMode(sectionItem, sectionId, touch.clientX, touch.clientY);
+    longPressTimer = null;
+  }, 500);
+}
+
+function handleTouchMove(e) {
+  if (longPressTimer && longPressTarget) {
+    const touch = e.touches[0];
+    const deltaX = touch.clientX - touchStartPos.x;
+    const deltaY = touch.clientY - touchStartPos.y;
+
+    // 左スワイプ検出（長押し中に左に50px以上移動）
+    if (deltaX < -50 && Math.abs(deltaY) < 30) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+      const sectionId = longPressTarget.getAttribute("data-section-id");
+      const section = state.sections.find((s) => s.id == sectionId);
+      if (section) {
+        e.preventDefault();
+        deleteSection(section.id, section.name);
+      }
+      longPressTarget = null;
+      return;
+    }
+  }
+
+  if (dragState.isDragging) {
+    e.preventDefault();
+    const touch = e.touches[0];
+    handleDrag(touch.clientX, touch.clientY);
+  }
+}
+
+function handleTouchEnd(e) {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+  longPressTarget = null;
+
+  if (dragState.isDragging) {
+    endDragMode();
+  }
+}
+
+function handleMouseDown(e) {
+  const sectionItem = e.target.closest(".sidebar-item[data-section-id]");
+  if (!sectionItem) return;
+
+  const sectionId = sectionItem.getAttribute("data-section-id");
+  if (!sectionId) return;
+
+  touchStartPos.x = e.clientX;
+  touchStartPos.y = e.clientY;
+  longPressTarget = sectionItem;
+
+  longPressTimer = setTimeout(() => {
+    startDragMode(sectionItem, sectionId, e.clientX, e.clientY);
+    longPressTimer = null;
+  }, 500);
+}
+
+function handleMouseMove(e) {
+  if (longPressTimer && longPressTarget) {
+    const deltaX = e.clientX - touchStartPos.x;
+    const deltaY = e.clientY - touchStartPos.y;
+
+    // 左スワイプ検出
+    if (deltaX < -50 && Math.abs(deltaY) < 30) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+      const sectionId = longPressTarget.getAttribute("data-section-id");
+      const section = state.sections.find((s) => s.id == sectionId);
+      if (section) {
+        e.preventDefault();
+        deleteSection(section.id, section.name);
+      }
+      longPressTarget = null;
+      return;
+    }
+  }
+
+  if (dragState.isDragging) {
+    e.preventDefault();
+    handleDrag(e.clientX, e.clientY);
+  }
+}
+
+function handleMouseUp(e) {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+  longPressTarget = null;
+
+  if (dragState.isDragging) {
+    endDragMode();
+  }
+}
+
+function startDragMode(element, sectionId, startX, startY) {
+  dragState.isDragging = true;
+  dragState.draggedElement = element;
+  dragState.startY = startY;
+  dragState.startX = startX;
+  dragState.currentY = startY;
+  dragState.sectionId = sectionId;
+
+  element.style.opacity = "0.5";
+  element.style.cursor = "grabbing";
+
+  // プレースホルダーを作成
+  const placeholder = document.createElement("div");
+  placeholder.className = "sidebar-item";
+  placeholder.style.height = element.offsetHeight + "px";
+  placeholder.style.border = "2px dashed var(--primary)";
+  placeholder.style.borderRadius = "8px";
+  placeholder.style.margin = "4px 0";
+  dragState.placeholder = placeholder;
+  element.parentNode.insertBefore(placeholder, element.nextSibling);
+}
+
+function handleDrag(clientX, clientY) {
+  if (!dragState.isDragging || !dragState.draggedElement) return;
+
+  dragState.currentY = clientY;
+  const draggedElement = dragState.draggedElement;
+  const allItems = Array.from(
+    document.querySelectorAll(".sidebar-item[data-section-id]")
+  );
+
+  draggedElement.style.transform = `translateY(${
+    clientY - dragState.startY
+  }px)`;
+  draggedElement.style.position = "relative";
+  draggedElement.style.zIndex = "1000";
+
+  // ドロップ位置を計算
+  let targetIndex = -1;
+  for (let i = 0; i < allItems.length; i++) {
+    const item = allItems[i];
+    if (item === draggedElement) continue;
+
+    const rect = item.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+
+    if (clientY < centerY) {
+      targetIndex = i;
+      break;
+    }
+  }
+
+  if (targetIndex === -1) {
+    targetIndex = allItems.length;
+  }
+
+  // プレースホルダーの位置を更新
+  const placeholder = dragState.placeholder;
+  if (placeholder && targetIndex < allItems.length) {
+    const targetItem = allItems[targetIndex];
+    if (targetItem !== draggedElement) {
+      targetItem.parentNode.insertBefore(placeholder, targetItem);
+    }
+  } else if (placeholder && allItems.length > 0) {
+    const lastItem = allItems[allItems.length - 1];
+    if (lastItem !== draggedElement) {
+      lastItem.parentNode.insertBefore(placeholder, lastItem.nextSibling);
+    }
+  }
+}
+
+async function endDragMode() {
+  if (!dragState.isDragging) return;
+
+  const draggedElement = dragState.draggedElement;
+  const placeholder = dragState.placeholder;
+
+  if (draggedElement && placeholder) {
+    // 新しい位置に要素を移動
+    placeholder.parentNode.insertBefore(draggedElement, placeholder);
+    placeholder.remove();
+
+    // スタイルをリセット
+    draggedElement.style.opacity = "";
+    draggedElement.style.cursor = "";
+    draggedElement.style.transform = "";
+    draggedElement.style.position = "";
+    draggedElement.style.zIndex = "";
+
+    // 新しい順番を取得
+    const allItems = Array.from(
+      document.querySelectorAll(".sidebar-item[data-section-id]")
+    );
+    const newOrder = allItems.map((item) =>
+      parseInt(item.getAttribute("data-section-id"))
+    );
+
+    // APIで順番を更新
+    try {
+      // 楽観的更新: セクションの順番を即座に更新
+      const sortedSections = newOrder
+        .map((id) => state.sections.find((s) => s.id == id))
+        .filter(Boolean);
+      state.sections = sortedSections;
+      render();
+      showToast("セクションの順番を更新しました");
+
+      // バックグラウンドでAPI呼び出し
+      API.put("/api/sections/reorder", { sectionIds: newOrder }).catch(
+        (error) => {
+          console.error("Reorder error:", error);
+          showToast("順番の更新に失敗しました", "error");
+          // エラー時は再取得
+          loadData().then(() => render());
+        }
+      );
+    } catch (error) {
+      console.error("Reorder error:", error);
+      showToast("順番の更新に失敗しました", "error");
+      // エラー時は再取得
+      await loadData();
+      render();
+    }
+  }
+
+  // 状態をリセット
+  dragState = {
+    isDragging: false,
+    draggedElement: null,
+    startY: 0,
+    startX: 0,
+    currentY: 0,
+    placeholder: null,
+    sectionId: null,
+  };
+}
+
 // 初期化
 async function init() {
   await loadData();
   await loadTasks();
   render();
+  setupLongPressHandlers();
 
   // 30日以上前のゴミ箱を自動クリーンアップ
   API.post("/api/cleanup");

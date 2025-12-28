@@ -39,6 +39,70 @@ app.post('/api/sections', async (c) => {
   return c.json({ id: result.meta.last_row_id, name, icon })
 })
 
+app.put('/api/sections/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  const body = await c.req.json()
+  
+  const fields: string[] = []
+  const values: any[] = []
+  
+  if (body.sort_order !== undefined) {
+    fields.push('sort_order = ?')
+    values.push(body.sort_order)
+  }
+  
+  if (fields.length === 0) {
+    return c.json({ error: 'No fields to update' }, 400)
+  }
+  
+  values.push(id)
+  await DB.prepare(`
+    UPDATE sections SET ${fields.join(', ')} WHERE id = ?
+  `).bind(...values).run()
+  
+  return c.json({ success: true })
+})
+
+app.put('/api/sections/reorder', async (c) => {
+  const { DB } = c.env
+  const { sectionIds } = await c.req.json()
+  
+  if (!Array.isArray(sectionIds)) {
+    return c.json({ error: 'sectionIds must be an array' }, 400)
+  }
+  
+  // トランザクションで順番を更新
+  for (let i = 0; i < sectionIds.length; i++) {
+    await DB.prepare('UPDATE sections SET sort_order = ? WHERE id = ?')
+      .bind(i + 1, sectionIds[i])
+      .run()
+  }
+  
+  return c.json({ success: true })
+})
+
+app.delete('/api/sections/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  
+  // セクションに紐づくタスクがあるか確認
+  const tasks = await DB.prepare(`
+    SELECT COUNT(*) as count FROM tasks WHERE section_id = ? AND is_deleted = 0
+  `).bind(id).first()
+  
+  const taskCount = (tasks as any)?.count || 0
+  if (taskCount > 0) {
+    // タスクがある場合は、セクションIDをNULLに更新
+    await DB.prepare('UPDATE tasks SET section_id = NULL WHERE section_id = ?').bind(id).run()
+  }
+  
+  // セクションを削除
+  await DB.prepare('DELETE FROM sections WHERE id = ?').bind(id).run()
+  
+  return c.json({ success: true })
+})
+
 // ============================================
 // API: タスク管理
 // ============================================
@@ -53,16 +117,22 @@ app.get('/api/tasks', async (c) => {
   const params: any[] = []
   
   if (view === 'today') {
-    whereClause += " AND t.due_date = date('now', 'localtime')"
+    whereClause += " AND t.due_date = date('now', 'localtime') AND t.is_completed = 0"
   } else if (view === 'upcoming') {
     whereClause += " AND t.due_date > date('now', 'localtime') AND t.is_completed = 0"
   } else if (view === 'important') {
     whereClause += ' AND t.is_important = 1 AND t.is_completed = 0'
   } else if (view === 'trash') {
     whereClause = 'WHERE t.is_deleted = 1'
+  } else if (view === 'logbox') {
+    // ログボックス: 完了したタスクで6ヶ月以内のもの
+    whereClause += " AND t.is_completed = 1 AND t.completed_at >= datetime('now', '-6 months', 'localtime')"
   } else if (sectionId) {
-    whereClause += ' AND t.section_id = ?'
+    whereClause += ' AND t.section_id = ? AND t.is_completed = 0'
     params.push(sectionId)
+  } else if (view === 'all') {
+    // すべてのビューでは未完了タスクのみ表示
+    whereClause += ' AND t.is_completed = 0'
   }
   
   const tasks = await DB.prepare(`
@@ -328,18 +398,25 @@ app.get('/api/stats', async (c) => {
     AND (last_reminded_at IS NULL OR last_reminded_at < date('now', 'localtime'))
   `).first()
   
+  const logbox = await DB.prepare(`
+    SELECT COUNT(*) as count FROM tasks 
+    WHERE is_deleted = 0 AND is_completed = 1 
+    AND completed_at >= datetime('now', '-6 months', 'localtime')
+  `).first()
+  
   return c.json({
     today: (today as any)?.count || 0,
     overdue: (overdue as any)?.count || 0,
     upcoming: (upcoming as any)?.count || 0,
     important: (important as any)?.count || 0,
     trash: (trash as any)?.count || 0,
-    reminders: (reminders as any)?.count || 0
+    reminders: (reminders as any)?.count || 0,
+    logbox: (logbox as any)?.count || 0
   })
 })
 
 // ============================================
-// API: ゴミ箱の自動削除（30日経過）
+// API: クリーンアップ（ゴミ箱とログボックスの自動削除）
 // ============================================
 app.post('/api/cleanup', async (c) => {
   const { DB } = c.env
@@ -348,6 +425,12 @@ app.post('/api/cleanup', async (c) => {
   await DB.prepare(`
     DELETE FROM tasks 
     WHERE is_deleted = 1 AND deleted_at < datetime('now', '-30 days')
+  `).run()
+  
+  // 6ヶ月以上前に完了したタスクを完全削除
+  await DB.prepare(`
+    DELETE FROM tasks 
+    WHERE is_completed = 1 AND completed_at < datetime('now', '-6 months', 'localtime')
   `).run()
   
   return c.json({ success: true })
