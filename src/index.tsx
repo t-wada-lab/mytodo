@@ -210,41 +210,57 @@ app.post('/api/tasks/:id/attachments', async (c) => {
   const { DB, R2 } = c.env
   const taskId = c.req.param('id')
   
-  const formData = await c.req.formData()
-  const file = formData.get('file') as File | null
-  const urlInput = formData.get('url') as string | null
-  
-  if (urlInput) {
-    // URL添付
-    const result = await DB.prepare(`
-      INSERT INTO attachments (task_id, type, name, url) VALUES (?, 'url', ?, ?)
-    `).bind(taskId, urlInput, urlInput).run()
+  try {
+    const formData = await c.req.formData()
+    const file = formData.get('file') as File | null
+    const urlInput = formData.get('url') as string | null
     
-    return c.json({ id: result.meta.last_row_id, type: 'url', url: urlInput })
+    if (urlInput) {
+      // URL添付
+      const result = await DB.prepare(`
+        INSERT INTO attachments (task_id, type, name, url) VALUES (?, 'url', ?, ?)
+      `).bind(taskId, urlInput, urlInput).run()
+      
+      return c.json({ id: result.meta.last_row_id, type: 'url', url: urlInput })
+    }
+    
+    if (!file) {
+      return c.json({ error: 'No file provided' }, 400)
+    }
+    
+    // ファイルサイズチェック（10MB制限）
+    const maxSize = 10 * 1024 * 1024 // 10MB
+    if (file.size > maxSize) {
+      return c.json({ error: 'File size exceeds 10MB limit' }, 400)
+    }
+    
+    // ファイルタイプ判定（写真またはPDFのみ許可）
+    const isImage = file.type.startsWith('image/')
+    const isPdf = file.type === 'application/pdf'
+    
+    if (!isImage && !isPdf) {
+      return c.json({ error: 'Only image and PDF files are allowed' }, 400)
+    }
+    
+    const type = isImage ? 'image' : 'pdf'
+    
+    // R2にアップロード
+    const key = `attachments/${taskId}/${Date.now()}-${file.name}`
+    await R2.put(key, await file.arrayBuffer(), {
+      httpMetadata: { contentType: file.type }
+    })
+    
+    const url = `/api/files/${key}`
+    
+    const result = await DB.prepare(`
+      INSERT INTO attachments (task_id, type, name, url) VALUES (?, ?, ?, ?)
+    `).bind(taskId, type, file.name, url).run()
+    
+    return c.json({ id: result.meta.last_row_id, type, name: file.name, url })
+  } catch (error) {
+    console.error('Upload error:', error)
+    return c.json({ error: 'Failed to upload file' }, 500)
   }
-  
-  if (!file) {
-    return c.json({ error: 'No file provided' }, 400)
-  }
-  
-  // ファイルタイプ判定
-  const isImage = file.type.startsWith('image/')
-  const isPdf = file.type === 'application/pdf'
-  const type = isImage ? 'image' : isPdf ? 'pdf' : 'file'
-  
-  // R2にアップロード
-  const key = `attachments/${taskId}/${Date.now()}-${file.name}`
-  await R2.put(key, await file.arrayBuffer(), {
-    httpMetadata: { contentType: file.type }
-  })
-  
-  const url = `/api/files/${key}`
-  
-  const result = await DB.prepare(`
-    INSERT INTO attachments (task_id, type, name, url) VALUES (?, ?, ?, ?)
-  `).bind(taskId, type, file.name, url).run()
-  
-  return c.json({ id: result.meta.last_row_id, type, name: file.name, url })
 })
 
 // 添付ファイル削除

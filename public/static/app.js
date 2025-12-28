@@ -30,7 +30,11 @@ const API = {
       method: 'POST',
       body: formData
     });
-    return res.json();
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Upload failed');
+    }
+    return data;
   }
 };
 
@@ -688,18 +692,48 @@ async function uploadFile(taskId, input) {
   const file = input.files[0];
   if (!file) return;
   
+  // ファイルサイズチェック（10MB制限）
+  const maxSize = 10 * 1024 * 1024; // 10MB
+  if (file.size > maxSize) {
+    showToast('ファイルサイズが大きすぎます（最大10MB）', 'error');
+    input.value = '';
+    return;
+  }
+  
+  // ファイルタイプチェック（写真またはPDFのみ）
+  const isImage = file.type.startsWith('image/');
+  const isPdf = file.type === 'application/pdf';
+  if (!isImage && !isPdf) {
+    showToast('写真またはPDFファイルを選択してください', 'error');
+    input.value = '';
+    return;
+  }
+  
   const formData = new FormData();
   formData.append('file', file);
   
   showToast('アップロード中...');
   
-  const result = await API.upload(`/api/tasks/${taskId}/attachments`, formData);
-  
-  const list = document.getElementById('attachments-list');
-  list.innerHTML += renderAttachment(result);
-  
-  input.value = '';
-  showToast('ファイルを添付しました');
+  try {
+    const result = await API.upload(`/api/tasks/${taskId}/attachments`, formData);
+    
+    if (result.error) {
+      showToast(`アップロードに失敗しました: ${result.error}`, 'error');
+      input.value = '';
+      return;
+    }
+    
+    const list = document.getElementById('attachments-list');
+    if (list) {
+      list.innerHTML += renderAttachment(result);
+      showToast('ファイルを添付しました');
+    }
+  } catch (error) {
+    console.error('Upload error:', error);
+    showToast('アップロードに失敗しました', 'error');
+  } finally {
+    input.value = '';
+  }
 }
 
 function showUrlInput(taskId) {
@@ -722,9 +756,16 @@ async function addUrlAttachment(taskId, url) {
 }
 
 async function deleteAttachment(id) {
-  await API.delete(`/api/attachments/${id}`);
-  await showTaskDetail(state.editingTask.id);
-  showToast('添付を削除しました');
+  try {
+    await API.delete(`/api/attachments/${id}`);
+    if (state.editingTask) {
+      await showTaskDetail(state.editingTask.id);
+    }
+    showToast('添付を削除しました');
+  } catch (error) {
+    console.error('Delete attachment error:', error);
+    showToast('添付の削除に失敗しました', 'error');
+  }
 }
 
 // セクション追加
@@ -750,13 +791,18 @@ function closeModal() {
 }
 
 // トースト通知
-function showToast(message) {
+function showToast(message, type = 'success') {
   const existing = document.querySelector('.toast');
   if (existing) existing.remove();
   
   const toast = document.createElement('div');
   toast.className = 'toast';
   toast.textContent = message;
+  
+  if (type === 'error') {
+    toast.style.background = 'var(--danger)';
+  }
+  
   document.body.appendChild(toast);
   
   setTimeout(() => toast.remove(), 3000);
